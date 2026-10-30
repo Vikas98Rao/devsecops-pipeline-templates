@@ -1,13 +1,26 @@
 # GitHub Actions - Docker Build and DevSecOps Security Pipeline
 # Author: Vikas Rao | Senior DevOps Engineer
+# NOTE: This is a TEMPLATE repo for reference. Trigger is manual (workflow_dispatch).
+# To use: copy this file into your project and add required secrets.
 
 name: DevSecOps Build Scan and Deploy
 
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
+  # Manual trigger only - this is a template/reference repo
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+
+# Required Secrets to configure in your repo:
+# GITHUB_TOKEN   - auto-provided by GitHub
+# AZURE_CREDENTIALS  - Azure service principal JSON
+# SONAR_TOKEN    - SonarQube/SonarCloud token
+# SONAR_HOST_URL - SonarQube host URL
 
 jobs:
   secret-scan:
@@ -20,7 +33,7 @@ jobs:
       - name: GitLeaks Secret Scan
         uses: gitleaks/gitleaks-action@v2
         env:
-          GITHUB_TOKEN: GITHUB_TOKEN_PLACEHOLDER
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   sast:
     name: SAST Analysis
@@ -28,6 +41,11 @@ jobs:
     needs: secret-scan
     steps:
       - uses: actions/checkout@v4
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
       - name: Semgrep SAST
         uses: returntocorp/semgrep-action@v1
         with:
@@ -43,37 +61,77 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build Docker Image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: false
-          tags: ghcr.io/IMAGE_NAME:latest
+          tags: ghcr.io/${{ github.repository }}:latest
           load: true
       - name: Trivy Container Scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ghcr.io/IMAGE_NAME:latest
+          image-ref: ghcr.io/${{ github.repository }}:latest
           format: sarif
           output: trivy-results.sarif
           severity: HIGH,CRITICAL
           exit-code: 1
+      - name: Upload Trivy Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  dependency-check:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - uses: actions/checkout@v4
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'my-app'
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports/
 
   deploy:
     name: Deploy to AKS
     runs-on: ubuntu-latest
-    needs: [build-and-scan]
-    if: github.ref == 'refs/heads/main'
+    needs: [build-and-scan, dependency-check]
+    if: github.event.inputs.environment == 'production'
     environment: production
     steps:
       - uses: actions/checkout@v4
       - name: Azure Login
         uses: azure/login@v2
         with:
-          creds: AZURE_CREDENTIALS_PLACEHOLDER
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Get AKS Credentials
+        run: az aks get-credentials --resource-group rg-aks-prod --name aks-prod-001
       - name: Deploy with Helm
         run: |
-          az aks get-credentials --resource-group rg-aks-prod --name aks-prod-001
           helm upgrade --install my-app ./helm/my-app \
             --namespace production \
+            --set image.tag=${{ github.sha }} \
+            --set image.repository=ghcr.io/${{ github.repository }} \
             --wait --timeout 5m
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status deployment/my-app -n production
+          kubectl get pods -n production -l app=my-app
