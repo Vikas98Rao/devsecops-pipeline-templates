@@ -1,0 +1,44 @@
+# Azure DevOps - Terraform DevSecOps Pipeline Template
+# Author: Vikas Rao | Senior DevOps Engineer
+
+trigger:
+  branches:
+    include: [main]
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: Lint
+  jobs:
+  - job: LintAndValidate
+    steps:
+    - script: terraform fmt -check -recursive
+    - script: terraform validate
+    - script: |
+        pip install checkov
+        checkov -d . --framework terraform
+
+- stage: SecurityScan
+  dependsOn: Lint
+  jobs:
+  - job: Scan
+    steps:
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/zricethezav/gitleaks/master/scripts/install.sh | sh -s -- -b /usr/local/bin
+        gitleaks detect --source . --redact
+      displayName: 'GitLeaks Secret Detection'
+    - script: |
+        docker run --rm -v "C:\DevopsInsider\Projects\GithubReadme_portfolio\Vikas98Rao:/src" aquasec/trivy:latest config /src --severity HIGH,CRITICAL
+      displayName: 'Trivy IaC Scan'
+
+- stage: CostEstimate
+  dependsOn: SecurityScan
+  jobs:
+  - job: Infracost
+    steps:
+    - script: |
+        curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+        infracost breakdown --path . --format table
+      env:
+        INFRACOST_API_KEY: 
